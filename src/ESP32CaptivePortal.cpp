@@ -1,27 +1,13 @@
-#include <ArduinoJson.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <DNSServer.h>
-#include <EEPROM.h>
+/*
+ * ESP32CaptivePortal Library Implementation
+ */
 
-// DNS Server for captive portal
-DNSServer dnsServer;
+#include "ESP32CaptivePortal.h"
+
 const byte DNS_PORT = 53;
 
-// Web Server
-WebServer server(80);
-
-// Access Point credentials
-const char* ssidAP = "CONNECTME";
-const char* passAP = "";  // Open network (no password)
-
-// EEPROM addresses
-#define SSID_ADDRESS 0
-#define PASS_ADDRESS 50
-#define EEPROM_SIZE 512
-
-// HTML for captive portal
-const char HTML_PAGE[] PROGMEM = R"rawliteral(
+// HTML templates
+const char ESP32CaptivePortal::HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -117,13 +103,6 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             background: #45a049;
             transform: scale(1.02);
         }
-        .success {
-            text-align: center;
-            padding: 20px;
-            background: rgba(76, 175, 80, 0.3);
-            border-radius: 10px;
-            margin-top: 20px;
-        }
     </style>
     <script>
         function selectNetwork(ssid) {
@@ -156,7 +135,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-const char SUCCESS_PAGE[] PROGMEM = R"rawliteral(
+const char ESP32CaptivePortal::SUCCESS_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -201,40 +180,53 @@ const char SUCCESS_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-void setup() {
-    Serial.begin(115200);
-    Serial.println("\n\nStarting ESP32 WiFi Configuration...");
+// Constructor
+ESP32CaptivePortal::ESP32CaptivePortal(const char* apName, const char* apPassword)
+    : _apName(apName)
+    , _apPassword(apPassword)
+    , _server(80)
+    , _isConnected(false)
+    , _connectionTimeout(10)
+    , _onConnectCallback(nullptr)
+    , _onConnectFailedCallback(nullptr)
+{
+}
+
+// Initialize
+void ESP32CaptivePortal::begin(int eepromSize, int ssidAddr, int passAddr) {
+    _eepromSize = eepromSize;
+    _ssidAddress = ssidAddr;
+    _passAddress = passAddr;
+    
+    Serial.println("\n\nESP32CaptivePortal: Starting...");
     
     // Initialize EEPROM
-    EEPROM.begin(EEPROM_SIZE);
+    EEPROM.begin(_eepromSize);
     
     // Try to read saved credentials
-    String savedSSID = readStringFromEEPROM(SSID_ADDRESS, 32);
-    String savedPass = readStringFromEEPROM(PASS_ADDRESS, 64);
+    String savedSSID = readStringFromEEPROM(_ssidAddress, 32);
+    String savedPass = readStringFromEEPROM(_passAddress, 64);
     
-    Serial.println("Saved credentials:");
-    Serial.println("SSID: " + savedSSID);
-    
-    // Try to connect to saved WiFi
     if (savedSSID.length() > 0) {
-        Serial.println("Attempting to connect to saved WiFi...");
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+        Serial.println("Found saved credentials, attempting connection...");
+        Serial.println("SSID: " + savedSSID);
         
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-            delay(500);
-            Serial.print(".");
-            attempts++;
-        }
-        
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\nConnected to WiFi!");
+        if (tryConnect(savedSSID, savedPass)) {
+            _isConnected = true;
+            _currentSSID = savedSSID;
+            Serial.println("✓ Connected to saved WiFi!");
             Serial.print("IP Address: ");
             Serial.println(WiFi.localIP());
-            return; // Successfully connected, exit setup
+            
+            if (_onConnectCallback) {
+                _onConnectCallback();
+            }
+            return;
         } else {
-            Serial.println("\nFailed to connect to saved WiFi.");
+            Serial.println("✗ Failed to connect to saved WiFi");
+            if (_onConnectFailedCallback) {
+                _onConnectFailedCallback();
+            }
         }
     }
     
@@ -242,53 +234,175 @@ void setup() {
     startAccessPoint();
 }
 
-void loop() {
-    dnsServer.processNextRequest();
-    server.handleClient();
-    
-    // If connected to WiFi in station mode, just print IP
-    if (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) {
-        static unsigned long lastPrint = 0;
-        if (millis() - lastPrint > 5000) {
-            Serial.print("Connected - IP: ");
-            Serial.println(WiFi.localIP());
-            lastPrint = millis();
-        }
+// Main loop handler
+void ESP32CaptivePortal::loop() {
+    if (!_isConnected) {
+        _dnsServer.processNextRequest();
+        _server.handleClient();
     }
 }
 
-void startAccessPoint() {
+// Check connection status
+bool ESP32CaptivePortal::isConnected() {
+    if (_isConnected && WiFi.status() != WL_CONNECTED) {
+        _isConnected = false;
+        Serial.println("WiFi connection lost!");
+    }
+    return _isConnected;
+}
+
+// Get current SSID
+String ESP32CaptivePortal::getSSID() {
+    return _currentSSID;
+}
+
+// Get IP address
+String ESP32CaptivePortal::getIP() {
+    if (_isConnected) {
+        return WiFi.localIP().toString();
+    }
+    return "";
+}
+
+// Clear credentials
+void ESP32CaptivePortal::clearCredentials() {
+    Serial.println("Clearing saved credentials...");
+    writeStringToEEPROM(_ssidAddress, "");
+    writeStringToEEPROM(_passAddress, "");
+    EEPROM.commit();
+    Serial.println("Credentials cleared. Restarting...");
+    delay(1000);
+    ESP.restart();
+}
+
+// Set connect callback
+void ESP32CaptivePortal::onConnect(void (*callback)()) {
+    _onConnectCallback = callback;
+}
+
+// Set connect failed callback
+void ESP32CaptivePortal::onConnectFailed(void (*callback)()) {
+    _onConnectFailedCallback = callback;
+}
+
+// Force access point mode
+void ESP32CaptivePortal::forceAccessPoint() {
+    Serial.println("Forcing Access Point mode...");
+    WiFi.disconnect();
+    startAccessPoint();
+}
+
+// Set connection timeout
+void ESP32CaptivePortal::setConnectionTimeout(int seconds) {
+    _connectionTimeout = seconds;
+}
+
+// ============ PRIVATE METHODS ============
+
+void ESP32CaptivePortal::startAccessPoint() {
     Serial.println("\nStarting Access Point...");
     
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(ssidAP, passAP);
+    WiFi.softAP(_apName, _apPassword);
     
     delay(100);
     
     IPAddress IP = WiFi.softAPIP();
     Serial.print("AP IP address: ");
     Serial.println(IP);
-    Serial.println("Connect to WiFi: " + String(ssidAP));
+    Serial.println("Connect to WiFi: " + String(_apName));
     
     // Start DNS server for captive portal
-    dnsServer.start(DNS_PORT, "*", IP);
+    _dnsServer.start(DNS_PORT, "*", IP);
     
     // Setup web server routes
-    server.on("/", handleRoot);
-    server.on("/connect", HTTP_POST, handleConnect);
-    server.onNotFound(handleRoot); // Redirect all unknown requests to root
+    _server.on("/", [this]() { this->handleRoot(); });
+    _server.on("/connect", HTTP_POST, [this]() { this->handleConnect(); });
+    _server.onNotFound([this]() { this->handleRoot(); });
     
-    server.begin();
-    Serial.println("HTTP server started");
+    _server.begin();
     Serial.println("Captive portal ready!");
 }
 
-void handleRoot() {
+void ESP32CaptivePortal::handleRoot() {
     Serial.println("Client connected to captive portal");
     
-    // Scan for networks
+    String html = FPSTR(HTML_PAGE);
+    html.replace("%NETWORKS%", generateNetworkList());
+    
+    _server.send(200, "text/html", html);
+}
+
+void ESP32CaptivePortal::handleConnect() {
+    String ssid = _server.arg("ssid");
+    String password = _server.arg("password");
+    
+    Serial.println("\nReceived WiFi credentials:");
+    Serial.println("SSID: " + ssid);
+    Serial.print("Password: ");
+    Serial.println(password.length() > 0 ? "********" : "(none)");
+    
+    // Save credentials to EEPROM
+    writeStringToEEPROM(_ssidAddress, ssid);
+    writeStringToEEPROM(_passAddress, password);
+    EEPROM.commit();
+    
+    Serial.println("Credentials saved to EEPROM");
+    
+    // Send success page
+    String html = FPSTR(SUCCESS_PAGE);
+    html.replace("%SSID%", ssid);
+    _server.send(200, "text/html", html);
+    
+    delay(2000);
+    
+    // Attempt to connect to WiFi
+    if (tryConnect(ssid, password)) {
+        _isConnected = true;
+        _currentSSID = ssid;
+        
+        Serial.println("\n✓ Successfully connected to WiFi!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        
+        // Stop AP and DNS server
+        _dnsServer.stop();
+        WiFi.softAPdisconnect(true);
+        
+        if (_onConnectCallback) {
+            _onConnectCallback();
+        }
+    } else {
+        Serial.println("\n✗ Failed to connect to WiFi");
+        Serial.println("Keeping Access Point active...");
+        
+        if (_onConnectFailedCallback) {
+            _onConnectFailedCallback();
+        }
+    }
+}
+
+bool ESP32CaptivePortal::tryConnect(String ssid, String password) {
+    Serial.println("Attempting to connect to WiFi...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    
+    int attempts = 0;
+    int maxAttempts = _connectionTimeout * 2; // 500ms per attempt
+    
+    while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println();
+    
+    return WiFi.status() == WL_CONNECTED;
+}
+
+String ESP32CaptivePortal::generateNetworkList() {
     int n = WiFi.scanNetworks();
-    Serial.println("Network scan complete");
+    Serial.printf("Found %d networks\n", n);
     
     String networkList = "";
     if (n == 0) {
@@ -305,64 +419,10 @@ void handleRoot() {
         }
     }
     
-    String html = FPSTR(HTML_PAGE);
-    html.replace("%NETWORKS%", networkList);
-    
-    server.send(200, "text/html", html);
+    return networkList;
 }
 
-void handleConnect() {
-    String ssid = server.arg("ssid");
-    String password = server.arg("password");
-    
-    Serial.println("\nReceived WiFi credentials:");
-    Serial.println("SSID: " + ssid);
-    Serial.print("Password: ");
-    Serial.println(password.length() > 0 ? "********" : "(none)");
-    
-    // Save credentials to EEPROM
-    writeStringToEEPROM(SSID_ADDRESS, ssid);
-    writeStringToEEPROM(PASS_ADDRESS, password);
-    EEPROM.commit();
-    
-    Serial.println("Credentials saved to EEPROM");
-    
-    // Send success page
-    String html = FPSTR(SUCCESS_PAGE);
-    html.replace("%SSID%", ssid);
-    server.send(200, "text/html", html);
-    
-    delay(2000);
-    
-    // Attempt to connect to WiFi
-    Serial.println("Attempting to connect to WiFi...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n✓ Successfully connected to WiFi!");
-        Serial.print("IP Address: ");
-        Serial.println(WiFi.localIP());
-        
-        // Stop AP and DNS server
-        dnsServer.stop();
-        WiFi.softAPdisconnect(true);
-    } else {
-        Serial.println("\n✗ Failed to connect to WiFi");
-        Serial.println("Restarting Access Point...");
-        startAccessPoint();
-    }
-}
-
-// Helper function to convert RSSI to quality percentage
-int getRSSIasQuality(int RSSI) {
+int ESP32CaptivePortal::getRSSIasQuality(int RSSI) {
     int quality = 0;
     if (RSSI <= -100) {
         quality = 0;
@@ -374,30 +434,27 @@ int getRSSIasQuality(int RSSI) {
     return quality;
 }
 
-// Helper function to display signal strength as bars
-String getSignalBars(int quality) {
-    if (quality >= 80) return "****";
-    if (quality >= 60) return "***";
-    if (quality >= 40) return "**";
-    if (quality >= 20) return "*";
+String ESP32CaptivePortal::getSignalBars(int quality) {
+    if (quality >= 80) return "▰▰▰▰";
+    if (quality >= 60) return "▰▰▰▱";
+    if (quality >= 40) return "▰▰▱▱";
+    if (quality >= 20) return "▰▱▱▱";
     return "▱▱▱▱";
 }
 
-// Write string to EEPROM
-void writeStringToEEPROM(int addr, String data) {
+void ESP32CaptivePortal::writeStringToEEPROM(int addr, String data) {
     int len = data.length();
     for (int i = 0; i < len; i++) {
         EEPROM.write(addr + i, data[i]);
     }
-    EEPROM.write(addr + len, '\0'); // Null terminator
+    EEPROM.write(addr + len, '\0');
 }
 
-// Read string from EEPROM
-String readStringFromEEPROM(int addr, int maxLen) {
+String ESP32CaptivePortal::readStringFromEEPROM(int addr, int maxLen) {
     String data = "";
     for (int i = 0; i < maxLen; i++) {
         char c = EEPROM.read(addr + i);
-        if (c == '\0' || c == 255) break; // 255 is unwritten EEPROM
+        if (c == '\0' || c == 255) break;
         data += c;
     }
     return data;
