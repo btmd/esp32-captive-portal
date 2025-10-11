@@ -1,6 +1,6 @@
 # ESP32CaptivePortal Library
 
-A beautiful and easy-to-use captive portal library for ESP32 WiFi configuration. Automatically saves credentials to EEPROM and reconnects on boot.
+A simple captive portal library for ESP32 WiFi configuration. Automatically saves credentials to EEPROM and reconnects on boot.
 
 ## Features
 
